@@ -24,10 +24,45 @@ if sys.version_info[0] == 2:
 else:
     import pickle
 
+secondary_device = torch.device("cuda:"+str(cfg.secondary_GPU_ID))    
+    
+def sort_by_keys(keys, captions, cap_lens, fake_imgs, true_imgs, bag):
+    sort_indices = torch.tensor([i[0] for i in sorted(enumerate(keys), key=lambda x:x[1])], dtype=torch.long)
+    keys = [i[1] for i in sorted(enumerate(keys), key=lambda x:x[1])]
+    
+    captions = captions[sort_indices]
+    cap_lens = cap_lens[sort_indices]
+    
+    for i in range(len(fake_imgs)):
+        fake_imgs[i] = fake_imgs[i][sort_indices]
+        
+        
+    if true_imgs is not None:
+        for i in range(len(true_imgs)):
+            true_imgs[i] = true_imgs[i][sort_indices]
+        
+    if bag is not None:
+        
+        sent_emb, real_labels, fake_labels, words_embs, class_ids = bag
+        
+        sent_emb = sent_emb[sort_indices]
+        real_labels = real_labels[sort_indices]
+        fake_labels = fake_labels[sort_indices]
+        words_embs = words_embs[sort_indices]
+        class_ids = class_ids[sort_indices]
+        
+        bag = [sent_emb, real_labels, fake_labels, words_embs, class_ids]
+   
+    return [keys, captions, cap_lens, fake_imgs, true_imgs, bag]
 
 def prepare_data(data):
-    imgs, captions, captions_lens, class_ids, keys = data
-
+    captions, captions_lens, misc= data
+    
+    imgs, class_ids, keys = misc
+    
+    imgs = imgs.copy()
+    class_ids = class_ids.clone()
+    
     # sort data by the length in a decreasing order
     sorted_cap_lens, sorted_cap_indices = \
         torch.sort(captions_lens, 0, True)
@@ -39,18 +74,18 @@ def prepare_data(data):
             real_imgs.append(Variable(imgs[i]).cuda())
         else:
             real_imgs.append(Variable(imgs[i]))
-
+            
     captions = captions[sorted_cap_indices].squeeze()
     class_ids = class_ids[sorted_cap_indices].numpy()
-    # sent_indices = sent_indices[sorted_cap_indices]
     keys = [keys[i] for i in sorted_cap_indices.numpy()]
-    # print('keys', type(keys), keys[-1])  # list
+
     if cfg.CUDA:
         captions = Variable(captions).cuda()
         sorted_cap_lens = Variable(sorted_cap_lens).cuda()
     else:
         captions = Variable(captions)
         sorted_cap_lens = Variable(sorted_cap_lens)
+              
 
     return [real_imgs, captions, sorted_cap_lens,
             class_ids, keys]
@@ -115,6 +150,8 @@ class TextDataset(data.Dataset):
         self.filenames, self.captions, self.ixtoword, \
             self.wordtoix, self.n_words = self.load_text_data(data_dir, split)
 
+        self.imperfect_captions = self.load_imperfect_text_data(data_dir, split)
+        
         self.class_id = self.load_class_id(split_dir, len(self.filenames))
         self.number_example = len(self.filenames)
 
@@ -248,6 +285,23 @@ class TextDataset(data.Dataset):
             filenames = test_names
         return filenames, captions, ixtoword, wordtoix, n_words
 
+     def load_imperfect_text_data(self, data_dir, split):
+        print('loading imperfect captions... from ',split)
+        filepath = os.path.join(data_dir,split,'imperfect_captions.pkl')
+        with open(filepath,'rb') as f:
+            imperfect_captions = pickle.load(f)
+        
+        imperfect_captions_new = {}
+        for key in imperfect_captions:
+            rev = []
+            sent = imperfect_captions[key][0]
+            for w in sent:
+                if w in self.wordtoix:
+                    rev.append(self.wordtoix[w])
+            imperfect_captions_new[key] = rev
+               
+        return imperfect_captions_new
+    
     def load_class_id(self, data_dir, total_num):
         if os.path.isfile(data_dir + '/class_info.pickle'):
             with open(data_dir + '/class_info.pickle', 'rb') as f:
@@ -286,6 +340,26 @@ class TextDataset(data.Dataset):
             x_len = cfg.TEXT.WORDS_NUM
         return x, x_len
 
+    def get_imperfect_caption(self, key):
+        # a list of indices for a sentence
+        sent_caption = np.asarray(self.imperfect_captions[key]).astype('int64')
+        
+        if (sent_caption == 0).sum() > 0:
+            print('ERROR: do not need END (0) token', sent_caption)
+        num_words = len(sent_caption)
+        x = np.zeros((cfg.TEXT.WORDS_NUM, 1), dtype='int64')
+        x_len = num_words
+        if num_words <= cfg.TEXT.WORDS_NUM:
+            x[:num_words, 0] = sent_caption
+        else:
+            ix = list(np.arange(num_words))  # 1, 2, 3,..., maxNum
+            np.random.shuffle(ix)
+            ix = ix[:cfg.TEXT.WORDS_NUM]
+            ix = np.sort(ix)
+            x[:, 0] = sent_caption[ix]
+            x_len = cfg.TEXT.WORDS_NUM
+        return x, x_len
+    
     def __getitem__(self, index):
         #
         key = self.filenames[index]
@@ -305,7 +379,11 @@ class TextDataset(data.Dataset):
         sent_ix = random.randint(0, self.embeddings_num)
         new_sent_ix = index * self.embeddings_num + sent_ix
         caps, cap_len = self.get_caption(new_sent_ix)
-        return imgs, caps, cap_len, cls_id, key
+        
+        # Get imperfect caption
+        imperfect_caps, imperfect_cap_len = self.get_imperfect_caption(key)
+        
+        return caps, cap_len, imperfect_caps, imperfect_cap_len, [imgs, cls_id, key]
 
     def get_mis_caption(self, cls_id):
         mis_match_captions_t = []

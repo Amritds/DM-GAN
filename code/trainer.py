@@ -15,15 +15,22 @@ from miscc.utils import mkdir_p
 from miscc.utils import build_super_images, build_super_images2
 from miscc.utils import weights_init, load_params, copy_G_params
 from model import G_DCGAN, G_NET
-from datasets import prepare_data
+from datasets import prepare_data, sort_by_keys
 from model import RNN_ENCODER, CNN_ENCODER
+
 
 from miscc.losses import words_loss
 from miscc.losses import discriminator_loss, generator_loss, KL_loss
+from miscc.losses import negative_ddva
+
+from copy import deepcopy
+
 import os
 import time
 import numpy as np
 import sys
+
+secondary_device = torch.device("cuda:"+str(cfg.secondary_GPU_ID))
 
 # ################# Text to image task############################ #
 class condGANTrainer(object):
@@ -139,13 +146,28 @@ class condGANTrainer(object):
                         torch.load(Dname, map_location=lambda storage, loc: storage)
                     netsD[i].load_state_dict(state_dict)
         # ########################################################### #
+        
+        # Create a target network.
+        target_netG = deepcopy(netG)
+                    
         if cfg.CUDA:
             text_encoder = text_encoder.cuda()
             image_encoder = image_encoder.cuda()
             netG.cuda()
+            
+            # The target network is stored on the scondary GPU.---------------------------------
+            target_netG.cuda() 
+            #target_netG.ca_net.device = secondary_device
+            #-----------------------------------------------------------------------------------
+
             for i in range(len(netsD)):
                 netsD[i].cuda()
-        return [text_encoder, image_encoder, netG, netsD, epoch]
+                
+        # Disable training in the target network:
+        for p in target_netG.parameters():
+            p.requires_grad = False  
+            
+        return [text_encoder, image_encoder, netG, target_netG, netsD, epoch]
 
     def define_optimizers(self, netG, netsD):
         optimizersD = []
@@ -175,10 +197,12 @@ class condGANTrainer(object):
         return real_labels, fake_labels, match_labels
 
     def save_model(self, netG, avg_param_G, netsD, epoch):
+        save_dir = '/home/adsueiitm/experiments/exp2/checkpoints'
         backup_para = copy_G_params(netG)
         load_params(netG, avg_param_G)
+        
         torch.save(netG.state_dict(),
-            '%s/netG_epoch_%d.pth' % (self.model_dir, epoch))
+            '%s/netG_epoch_%d.pth' % (save_dir, epoch))
         load_params(netG, backup_para)
         #
         for i in range(len(netsD)):
@@ -235,7 +259,7 @@ class condGANTrainer(object):
 
 
     def train(self):
-        text_encoder, image_encoder, netG, netsD, start_epoch = self.build_models()
+        text_encoder, image_encoder, netG, target_netG, netsD, start_epoch = self.build_models()
         avg_param_G = copy_G_params(netG)
         optimizerG, optimizersD = self.define_optimizers(netG, netsD)
         real_labels, fake_labels, match_labels = self.prepare_labels()
@@ -248,6 +272,8 @@ class condGANTrainer(object):
             noise, fixed_noise = noise.cuda(), fixed_noise.cuda()
 
         gen_iterations = 0
+        sliding_window = []
+        
         # gen_iterations = start_epoch * self.num_batches
         for epoch in range(start_epoch, self.max_epoch):
             start_t = time.time()
@@ -262,7 +288,13 @@ class condGANTrainer(object):
                 # (1) Prepare training data and Compute text embeddings
                 ######################################################
                 data = data_iter.next()
-                imgs, captions, cap_lens, class_ids, keys = prepare_data(data)
+                
+                captions, cap_lens, imperfect_captions, imperfect_cap_lens, misc = data
+                
+                # Generate images for human-text ----------------------------------------------------------------
+                data_human = [captions, cap_lens, misc]
+                
+                imgs, captions, cap_lens, class_ids, keys = prepare_data(data_human)
 
                 hidden = text_encoder.init_hidden(batch_size)
                 # words_embs: batch_size x nef x seq_len
@@ -280,6 +312,44 @@ class condGANTrainer(object):
                 noise.data.normal_(0, 1)
                 fake_imgs, _, mu, logvar = netG(noise, sent_emb, words_embs, mask, cap_lens)
 
+                # Generate images for imperfect caption-text-------------------------------------------------------
+
+                data_imperfect = [imperfect_captions, imperfect_cap_lens, misc]
+                    
+                imgs, imperfect_captions, imperfect_cap_lens, i_class_ids, imperfect_keys = prepare_data(data_imperfect)
+                
+                i_hidden = text_encoder.init_hidden(batch_size)
+                i_words_embs, i_sent_emb = text_encoder(imperfect_captions, imperfect_cap_lens, i_hidden)
+                i_words_embs, i_sent_emb = i_words_embs.detach(), i_sent_emb.detach()
+                i_mask = (imperfect_captions == 0)
+                i_num_words = i_words_embs.size(2)
+                
+                if i_mask.size(1) > i_num_words:
+                    i_mask = i_mask[:, :i_num_words]
+                    
+                # Move tensors to the secondary device.
+                #noise  = noise.to(secondary_device) # IMPORTANT! We are reusing the same noise.
+                #i_sent_emb = i_sent_emb.to(secondary_device)
+                #i_words_embs = i_words_embs.to(secondary_device)
+                #i_mask = i_mask.to(secondary_device)
+                
+                # Generate images.
+                imperfect_fake_imgs, _, _, _ = target_netG(noise, i_sent_emb, i_words_embs, i_mask) 
+                
+                # Sort the results by keys to align ------------------------------------------------------------------------
+                bag = [sent_emb, real_labels, fake_labels, words_embs, class_ids]
+                
+                keys, captions, cap_lens, fake_imgs, _, sorted_bag = sort_by_keys(keys, captions, cap_lens, fake_imgs,\
+                                                                                  None, bag)
+                    
+                sent_emb, real_labels, fake_labels, words_embs, class_ids = \
+                            sorted_bag
+                 
+                imperfect_keys, imperfect_captions, imperfect_cap_lens, imperfect_fake_imgs, imgs, _ = \
+                            sort_by_keys(imperfect_keys, imperfect_captions, imperfect_cap_lens, imperfect_fake_imgs, imgs,None)
+                    
+                #-----------------------------------------------------------------------------------------------------------
+ 
                 #######################################################
                 # (3) Update D network
                 ######################################################
@@ -312,36 +382,51 @@ class condGANTrainer(object):
                 kl_loss = KL_loss(mu, logvar)
                 errG_total += kl_loss
                 G_logs += 'kl_loss: %.2f ' % kl_loss.item()
+                
+                # Shift device -----------------------------------------------------
+                #for i in range(len(imgs)):
+                #    imgs[i] = imgs[i].to(secondary_device)
+                #    fake_imgs[i] = fake_imgs[i].to(secondary_device)
+                   
+                print('Discriminator loss: ', errG_total)
+                
+                # Compute and add ddva loss ---------------------------------------------------------------------
+                neg_ddva = negative_ddva(imperfect_fake_imgs, imgs, fake_imgs)
+                neg_ddva *= 10. # Scale so that the ddva score is not overwhelmed by other losses.
+                errG_total += neg_ddva.to(cfg.GPU_ID)
+                #G_logs += 'negative_ddva_loss: %.2f ' % neg_ddva
+                #------------------------------------------------------------------------------------------------
+                
                 # backward and update parameters
                 errG_total.backward()
                 optimizerG.step()
                 for p, avg_p in zip(netG.parameters(), avg_param_G):
                     avg_p.mul_(0.999).add_(0.001, p.data)
 
-                if gen_iterations % 100 == 0:
-                    print('Epoch [{}/{}] Step [{}/{}]'.format(epoch, self.max_epoch, step,
+                if len(sliding_window)==100:
+                	del sliding_window[0]
+                sliding_window.append(neg_ddva)
+                sliding_avg_ddva =  sum(sliding_window)/len(sliding_window)
+
+                print('sliding_window avg NEG DDVA: ',sliding_avg_ddva)
+                print('Negative ddva: ', neg_ddva)
+                
+                #if gen_iterations % 100 == 0:
+                #    print('Epoch [{}/{}] Step [{}/{}]'.format(epoch, self.max_epoch, step,
                                                               self.num_batches) + ' ' + D_logs + ' ' + G_logs)
-                # save images
-                if gen_iterations % 10000 == 0:
-                    backup_para = copy_G_params(netG)
-                    load_params(netG, avg_param_G)
-                    #self.save_img_results(netG, fixed_noise, sent_emb, words_embs, mask, image_encoder,
-                    #                      captions, cap_lens, epoch, imgs[-1], name='average')
-                    load_params(netG, backup_para)
-                    #
-                    # self.save_img_results(netG, fixed_noise, sent_emb,
-                    #                       words_embs, mask, image_encoder,
-                    #                       captions, cap_lens,
-                    #                       epoch, name='current')
-                # if gen_iterations % 1000 == 0:
-                #    time.sleep(30)
-                # if gen_iterations % 10000 == 0:
-                #    time.sleep(160)
+                
+                # Copy parameters to the target network.
+                #if gen_iterations % 4 == 0:
+                load_params(target_netG, copy_G_params(netG))
+                # Disable training in the target network:
+                for p in target_netG.parameters():
+                    p.requires_grad = False
+                    
             end_t = time.time()
 
-            print('''[%d/%d] Loss_D: %.2f Loss_G: %.2f Time: %.2fs''' % (
-                epoch, self.max_epoch, errD_total.item(), errG_total.item(), end_t - start_t))
-            print('-' * 89)
+            #print('''[%d/%d] Loss_D: %.2f Loss_G: %.2f Time: %.2fs''' % (
+            #    epoch, self.max_epoch, errD_total.item(), errG_total.item(), end_t - start_t))
+            #print('-' * 89)
             if epoch % cfg.TRAIN.SNAPSHOT_INTERVAL == 0:  # and epoch != 0:
                 self.save_model(netG, avg_param_G, netsD, epoch)
 
